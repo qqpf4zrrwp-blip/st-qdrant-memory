@@ -13,6 +13,8 @@ const defaultSettings = {
   embeddingProvider: "openai",
   openaiApiKey: "",
   openRouterApiKey: "",
+  googleApiKey: "",
+  googleApiBaseUrl: "https://generativelanguage.googleapis.com/v1beta",
   localEmbeddingUrl: "",
   localEmbeddingApiKey: "",
   embeddingModel: "text-embedding-3-large",
@@ -104,11 +106,26 @@ const EMBEDDING_MODEL_OPTIONS = {
       label: "Google: Gemini Embedding 001",
     },
   ],
+  google: [
+    {
+      value: "models/gemini-embedding-001",
+      label: "Gemini Embedding 001 (3072d)",
+    },
+    {
+      value: "models/text-embedding-004",
+      label: "Text Embedding 004 (768d)",
+    },
+    {
+      value: "models/embedding-001",
+      label: "Embedding 001 (768d)",
+    },
+  ],
 }
 
 const DEFAULT_MODEL_BY_PROVIDER = {
   openai: "text-embedding-3-large",
   openrouter: EMBEDDING_MODEL_OPTIONS.openrouter[0].value,
+  google: EMBEDDING_MODEL_OPTIONS.google[0].value,
 }
 
 const OPENROUTER_MODEL_ALIASES = {
@@ -232,6 +249,12 @@ function getEmbeddingDimensions() {
     "qwen/qwen3-embedding-8b": 4096,
     "mistralai/mistral-embed-2312": 1024,
     "google/gemini-embedding-001": 3072,
+    "models/gemini-embedding-001": 3072,
+    "models/text-embedding-004": 768,
+    "models/embedding-001": 768,
+    "gemini-embedding-001": 3072,
+    "text-embedding-004": 768,
+    "embedding-001": 768,
   }
 
   const customDimensions = Number.parseInt(settings.customEmbeddingDimensions, 10)
@@ -300,38 +323,47 @@ function updateLocalEmbeddingDimensions(vector) {
 function getEmbeddingProviderError() {
   const provider = settings.embeddingProvider || "openai"
 
-  const validProviders = ["openai", "openrouter", "local"]
+  const validProviders = ["openai", "openrouter", "google", "local"]
   if (!validProviders.includes(provider)) {
     return `Unsupported embedding provider: ${provider}`
   }
 
   if (provider === "openai") {
     if (!settings.openaiApiKey || !settings.openaiApiKey.trim()) {
-      return "OpenAI API key not set"
+      return "尚未設定 OpenAI API Key"
     }
   }
 
   if (provider === "openrouter") {
     if (!settings.openRouterApiKey || !settings.openRouterApiKey.trim()) {
-      return "OpenRouter API key not set"
+      return "尚未設定 OpenRouter API Key"
+    }
+  }
+
+  if (provider === "google") {
+    if (!settings.googleApiKey || !settings.googleApiKey.trim()) {
+      return "尚未設定 Google AI API Key"
+    }
+    if (!settings.embeddingModel || !settings.embeddingModel.trim()) {
+      return "尚未選擇 Google 嵌入模型"
     }
   }
 
   if (provider === "local") {
     if (!settings.localEmbeddingUrl || !settings.localEmbeddingUrl.trim()) {
-      return "Local embedding URL not set"
+      return "尚未設定本機嵌入服務的 URL"
     }
 
     if (settings.customEmbeddingDimensions != null && settings.customEmbeddingDimensions !== "") {
       const customDimensions = Number.parseInt(settings.customEmbeddingDimensions, 10)
       if (!Number.isFinite(customDimensions) || customDimensions <= 0) {
-        return "Embedding dimensions must be a positive number"
+        return "嵌入向量維度必須是正整數"
       }
     }
   }
 
   if (!provider) {
-    return "Embedding provider not configured"
+    return "尚未設定嵌入服務供應商"
   }
 
   return null
@@ -634,7 +666,7 @@ async function generateEmbedding(text) {
     const headers = {
       "Content-Type": "application/json",
     }
-    const body = {
+    let body = {
       model: settings.embeddingModel,
       input: text,
     }
@@ -649,6 +681,18 @@ async function generateEmbedding(text) {
       }
       if (document?.title) {
         headers["X-Title"] = document.title
+      }
+    } else if (provider === "google") {
+      const baseUrl = (settings.googleApiBaseUrl || "https://generativelanguage.googleapis.com/v1beta").replace(/\/$/, "")
+      const modelPath = settings.embeddingModel.startsWith("models/")
+        ? settings.embeddingModel
+        : `models/${settings.embeddingModel}`
+      url = `${baseUrl}/${modelPath}:embedContent?key=${encodeURIComponent(settings.googleApiKey.trim())}`
+      body = {
+        model: modelPath,
+        content: {
+          parts: [{ text }],
+        },
       }
     } else if (provider === "local") {
       url = settings.localEmbeddingUrl.trim()
@@ -683,6 +727,9 @@ async function generateEmbedding(text) {
       embeddingVector = data.data[0].embedding
     } else if (Array.isArray(data?.data) && Array.isArray(data.data[0]?.vector)) {
       embeddingVector = data.data[0].vector
+    } else if (Array.isArray(data?.embedding?.values)) {
+      // Google AI format: { embedding: { values: [...] } }
+      embeddingVector = data.embedding.values
     } else if (Array.isArray(data?.embedding)) {
       embeddingVector = data.embedding
     } else if (Array.isArray(data?.embeddings)) {
@@ -701,6 +748,49 @@ async function generateEmbedding(text) {
     console.error("[Qdrant Memory] Error generating embedding:", error)
     return null
   }
+}
+
+// Fetch available embedding models from Google AI
+async function fetchGoogleEmbeddingModels(apiKey, baseUrl) {
+  const trimmedKey = (apiKey || "").trim()
+  if (!trimmedKey) {
+    throw new Error("尚未設定 Google AI API Key")
+  }
+
+  const trimmedBase = (baseUrl || "https://generativelanguage.googleapis.com/v1beta").replace(/\/$/, "")
+  const url = `${trimmedBase}/models?key=${encodeURIComponent(trimmedKey)}&pageSize=200`
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  })
+
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}))
+    const msg = errData?.error?.message || `${response.status} ${response.statusText}`
+    throw new Error(`Google API 錯誤：${msg}`)
+  }
+
+  const data = await response.json()
+  const models = Array.isArray(data?.models) ? data.models : []
+
+  // Only keep models that support embedContent
+  const embeddingModels = models.filter((m) => {
+    const methods = m?.supportedGenerationMethods || []
+    return methods.includes("embedContent") || methods.includes("batchEmbedContents")
+  })
+
+  return embeddingModels.map((m) => {
+    const name = m.name || ""
+    const dim = m?.outputDimension || m?.outputDimensionality || null
+    const displayName = m?.displayName || name.replace(/^models\//, "")
+    const dimText = dim ? ` (${dim}d)` : ""
+    return {
+      value: name,
+      label: `${displayName}${dimText}`,
+      dimension: dim,
+    }
+  })
 }
 
 // ============================================================================
@@ -898,8 +988,8 @@ if (settings.debugMode) {
 function formatMemories(memories) {
   if (!memories || memories.length === 0) return ""
 
-  let formatted = "\n[Past chat memories]\n\n"
-  
+  let formatted = "\n[過往對話記憶]\n\n"
+
   // Get persona name for display
   const personaName = getPersonaName()
 
@@ -909,19 +999,19 @@ function formatMemories(memories) {
     let speakerLabel
     if (payload.isChunk) {
       // For conversation chunks, show all speakers
-      speakerLabel = `Conversation (${payload.speakers})`
+      speakerLabel = `對話（${payload.speakers}）`
     } else {
       // For individual messages (legacy format), use persona name
-      speakerLabel = payload.speaker === "user" 
-        ? `${personaName} said`   // ← CHANGED: Use personaName instead of "User"
-        : "Character said"
+      speakerLabel = payload.speaker === "user"
+        ? `${personaName} 說`
+        : "角色說"
     }
 
     let text = payload.text.replace(/\n/g, " ") // flatten newlines
 
     const score = (memory.score * 100).toFixed(0)
 
-    formatted += `• ${speakerLabel}: "${text}" (score: ${score}%)\n\n`
+    formatted += `• ${speakerLabel}：「${text}」（相關度：${score}%）\n\n`
   })
 
   return formatted
@@ -1042,7 +1132,7 @@ async function saveChunkToQdrant(chunk, participants) {
     if (alreadyExists) {
       if (settings.showMemoryNotifications) {
         const toastr = window.toastr
-        toastr.info("Similar conversation already saved", "Qdrant Memory", { timeOut: 1500 })
+        toastr.info("已儲存過類似對話", "Qdrant Memory", { timeOut: 1500 })
       }
       return false
     }
@@ -1490,7 +1580,7 @@ async function indexCharacterChats() {
   const $ = window.$
 
   if (!characterName) {
-    toastr.warning("No character selected", "Qdrant Memory")
+    toastr.warning("尚未選擇角色", "Qdrant Memory")
     return
   }
 
@@ -1516,13 +1606,13 @@ async function indexCharacterChats() {
       width: 90%;
     ">
       <div style="color: #333;">
-        <h3 style="margin-top: 0;">Indexing Chats - ${characterName}</h3>
-        <p id="qdrant_index_status">Scanning for chat files...</p>
+        <h3 style="margin-top: 0;">索引聊天記錄 - ${characterName}</h3>
+        <p id="qdrant_index_status">正在掃描聊天檔案...</p>
         <div style="background: #f0f0f0; border-radius: 5px; height: 20px; margin: 15px 0; overflow: hidden;">
           <div id="qdrant_index_progress" style="background: #4CAF50; height: 100%; width: 0%; transition: width 0.3s;"></div>
         </div>
         <p id="qdrant_index_details" style="font-size: 0.9em; color: #666;"></p>
-        <button id="qdrant_index_cancel" class="menu_button" style="margin-top: 15px;">Cancel</button>
+        <button id="qdrant_index_cancel" class="menu_button" style="margin-top: 15px;">取消</button>
       </div>
     </div>
     <div id="qdrant_index_overlay" style="
@@ -1546,7 +1636,7 @@ async function indexCharacterChats() {
   const setCancelButtonToClose = () => {
     $("#qdrant_index_cancel")
       .prop("disabled", false)
-      .text("Close")
+      .text("關閉")
       .off("click")
       .on("click", closeModal)
   }
@@ -1554,7 +1644,7 @@ async function indexCharacterChats() {
   let cancelled = false
   $("#qdrant_index_cancel").on("click", () => {
     cancelled = true
-    $("#qdrant_index_cancel").text("Cancelling...").prop("disabled", true)
+    $("#qdrant_index_cancel").text("取消中...").prop("disabled", true)
   })
 
   try {
@@ -1562,7 +1652,7 @@ async function indexCharacterChats() {
     const chatFiles = await getCharacterChats(characterName)
 
     if (chatFiles.length === 0) {
-      $("#qdrant_index_status").text("No chat files found")
+      $("#qdrant_index_status").text("找不到聊天檔案")
       setCancelButtonToClose()
       setTimeout(() => {
         closeModal()
@@ -1570,7 +1660,7 @@ async function indexCharacterChats() {
       return
     }
 
-    $("#qdrant_index_status").text(`Found ${chatFiles.length} chat files`)
+    $("#qdrant_index_status").text(`找到 ${chatFiles.length} 個聊天檔案`)
 
     const collectionName = getCollectionName(characterName)
 
@@ -1586,8 +1676,8 @@ async function indexCharacterChats() {
       const progress = ((i / chatFiles.length) * 100).toFixed(0)
 
       $("#qdrant_index_progress").css("width", `${progress}%`)
-      $("#qdrant_index_status").text(`Processing chat ${i + 1}/${chatFiles.length}`)
-      $("#qdrant_index_details").text(`File: ${chatFile}`)
+      $("#qdrant_index_status").text(`處理聊天檔案 ${i + 1}/${chatFiles.length}`)
+      $("#qdrant_index_details").text(`檔案：${chatFile}`)
 
       // Load chat file
       const chatData = await loadChatFile(characterName, chatFile)
@@ -1617,7 +1707,7 @@ async function indexCharacterChats() {
           savedChunks++
         }
 
-        $("#qdrant_index_details").text(`Saved: ${savedChunks} | Skipped: ${skippedChunks} | Total: ${totalChunks}`)
+        $("#qdrant_index_details").text(`已儲存：${savedChunks} | 已略過：${skippedChunks} | 總計：${totalChunks}`)
       }
     }
 
@@ -1625,19 +1715,19 @@ async function indexCharacterChats() {
     $("#qdrant_index_progress").css("width", "100%")
 
     if (cancelled) {
-      $("#qdrant_index_status").text("Indexing cancelled")
-      toastr.info(`Indexed ${savedChunks} chunks before cancelling`, "Qdrant Memory")
+      $("#qdrant_index_status").text("索引已取消")
+      toastr.info(`取消前已索引 ${savedChunks} 個區塊`, "Qdrant Memory")
     } else {
-      $("#qdrant_index_status").text("Indexing complete!")
-      toastr.success(`Indexed ${savedChunks} new chunks, skipped ${skippedChunks} existing`, "Qdrant Memory")
+      $("#qdrant_index_status").text("索引完成！")
+      toastr.success(`新增 ${savedChunks} 個區塊，略過 ${skippedChunks} 個已存在區塊`, "Qdrant Memory")
     }
 
     setCancelButtonToClose()
   } catch (error) {
     console.error("[Qdrant Memory] Error indexing chats:", error)
-    $("#qdrant_index_status").text("Error during indexing")
+    $("#qdrant_index_status").text("索引時發生錯誤")
     $("#qdrant_index_details").text(error.message)
-    toastr.error("Failed to index chats", "Qdrant Memory")
+    toastr.error("索引聊天記錄失敗", "Qdrant Memory")
     setCancelButtonToClose()
   }
 }
@@ -1739,7 +1829,7 @@ globalThis.qdrantMemoryInterceptor = async (chat, contextSize, abort, type) => {
 
       const toastr = window.toastr
       if (settings.showMemoryNotifications) {
-        toastr.info(`Retrieved ${memories.length} relevant memories`, "Qdrant Memory", { timeOut: 2000 })
+        toastr.info(`已取回 ${memories.length} 則相關記憶`, "Qdrant Memory", { timeOut: 2000 })
       }
     } else {
       if (settings.debugMode) {
@@ -1991,7 +2081,7 @@ async function showMemoryViewer() {
 
   if (!characterName) {
     const toastr = window.toastr
-    toastr.warning("No character selected", "Qdrant Memory")
+    toastr.warning("尚未選擇角色", "Qdrant Memory")
     return
   }
 
@@ -2000,7 +2090,7 @@ async function showMemoryViewer() {
 
   if (!info) {
     const toastr = window.toastr
-    toastr.warning(`No memories found for ${characterName}`, "Qdrant Memory")
+    toastr.warning(`找不到 ${characterName} 的記憶`, "Qdrant Memory")
     return
   }
 
@@ -2021,15 +2111,15 @@ async function showMemoryViewer() {
             width: 90%;
         ">
             <div style="color: #333;">
-                <h3 style="margin-top: 0;">Memory Viewer - ${characterName}</h3>
-                <p><strong>Collection:</strong> ${collectionName}</p>
-                <p><strong>Total Memories:</strong> ${count}</p>
+                <h3 style="margin-top: 0;">記憶檢視器 - ${characterName}</h3>
+                <p><strong>Collection：</strong> ${collectionName}</p>
+                <p><strong>記憶總數：</strong> ${count}</p>
                 <div style="margin-top: 20px; display: flex; gap: 10px;">
                     <button id="qdrant_delete_collection_btn" class="menu_button" style="background-color: #dc3545; color: white;">
-                        Delete All Memories
+                        刪除全部記憶
                     </button>
                     <button id="qdrant_close_modal" class="menu_button">
-                        Close
+                        關閉
                     </button>
                 </div>
             </div>
@@ -2055,20 +2145,20 @@ async function showMemoryViewer() {
 
   $("#qdrant_delete_collection_btn").on("click", async function () {
     const confirmed = confirm(
-      `Are you sure you want to delete ALL memories for ${characterName}? This cannot be undone!`,
+      `確定要刪除 ${characterName} 的所有記憶嗎？此動作無法復原！`,
     )
     if (confirmed) {
-      $(this).prop("disabled", true).text("Deleting...")
+      $(this).prop("disabled", true).text("刪除中...")
       const success = await deleteCollection(collectionName)
       if (success) {
         const toastr = window.toastr
-        toastr.success(`All memories deleted for ${characterName}`, "Qdrant Memory")
+        toastr.success(`已刪除 ${characterName} 的全部記憶`, "Qdrant Memory")
         $("#qdrant_modal").remove()
         $("#qdrant_overlay").remove()
       } else {
         const toastr = window.toastr
-        toastr.error("Failed to delete memories", "Qdrant Memory")
-        $(this).prop("disabled", false).text("Delete All Memories")
+        toastr.error("刪除記憶失敗", "Qdrant Memory")
+        $(this).prop("disabled", false).text("刪除全部記憶")
       }
     }
   })
@@ -2140,214 +2230,235 @@ function createSettingsUI() {
                 </div>
                 <div class="inline-drawer-content">
                     <p style="margin: 10px 0; color: #666; font-size: 0.9em;">
-                        Automatic memory creation with temporal context
+                        自動建立帶有時間脈絡的長期記憶
                     </p>
-                    
+
                     <div style="margin: 15px 0;">
                         <label style="display: flex; align-items: center; gap: 10px;">
                             <input type="checkbox" id="qdrant_enabled" ${settings.enabled ? "checked" : ""} />
-                            <strong>Enable Qdrant Memory</strong>
+                            <strong>啟用 Qdrant Memory</strong>
                         </label>
                     </div>
-            
+
             <hr style="margin: 15px 0;" />
-            
-            <h4>Connection Settings</h4>
-            
+
+            <h4>連線設定</h4>
+
             <div style="margin: 10px 0;">
-                <label><strong>Qdrant URL:</strong></label>
-                <input type="text" id="qdrant_url" class="text_pole" value="${settings.qdrantUrl}" 
-                       style="width: 100%; margin-top: 5px;" 
+                <label><strong>Qdrant URL：</strong></label>
+                <input type="text" id="qdrant_url" class="text_pole" value="${settings.qdrantUrl}"
+                       style="width: 100%; margin-top: 5px;"
                        placeholder="http://localhost:6333" />
-                <small style="color: #666;">URL of your Qdrant instance</small>
+                <small style="color: #666;">您的 Qdrant 實例網址</small>
             </div>
 
              <div style="margin: 10px 0;">
-                <label><strong>Qdrant API Key:</strong></label>
+                <label><strong>Qdrant API Key：</strong></label>
                 <input type="password" id="qdrant_api_key" class="text_pole" value="${settings.qdrantApiKey || ""}"
                        style="width: 100%; margin-top: 5px;"
-                       placeholder="Optional - leave empty if not required" />
-                <small style="color: #666;">API key for Qdrant authentication (optional)</small>
+                       placeholder="選填 - 若不需要驗證可留空" />
+                <small style="color: #666;">Qdrant 驗證用 API Key（選填）</small>
             </div>
-            
+
             <div style="margin: 10px 0;">
-                <label><strong>Base Collection Name:</strong></label>
+                <label><strong>基礎 Collection 名稱：</strong></label>
                 <input type="text" id="qdrant_collection" class="text_pole" value="${settings.collectionName}"
                        style="width: 100%; margin-top: 5px;"
                        placeholder="sillytavern_memories" />
-                <small style="color: #666;">Base name for collections (character name will be appended)</small>
+                <small style="color: #666;">Collection 的基礎名稱（角色名會自動接在後面）</small>
             </div>
 
             <div style="margin: 10px 0;">
-                <label><strong>Embedding Provider:</strong></label>
+                <label><strong>嵌入向量來源：</strong></label>
                 <select id="qdrant_embedding_provider" class="text_pole" style="width: 100%; margin-top: 5px;">
                     <option value="openai" ${settings.embeddingProvider === "openai" ? "selected" : ""}>OpenAI</option>
                     <option value="openrouter" ${settings.embeddingProvider === "openrouter" ? "selected" : ""}>OpenRouter</option>
-                    <option value="local" ${settings.embeddingProvider === "local" ? "selected" : ""}>Local/custom endpoint</option>
+                    <option value="google" ${settings.embeddingProvider === "google" ? "selected" : ""}>Google AI (Gemini)</option>
+                    <option value="local" ${settings.embeddingProvider === "local" ? "selected" : ""}>本機 / 自訂端點</option>
                 </select>
-                <small style="color: #666;">Choose the API used for generating embeddings</small>
+                <small style="color: #666;">選擇用來產生嵌入向量的 API</small>
             </div>
 
             <div id="qdrant_openai_key_group" style="margin: 10px 0;">
-                <label><strong>OpenAI API Key:</strong></label>
+                <label><strong>OpenAI API Key：</strong></label>
                 <input type="password" id="qdrant_openai_key" class="text_pole" value="${settings.openaiApiKey}"
                        placeholder="sk-..." style="width: 100%; margin-top: 5px;" />
-                <small style="color: #666;">Required when using OpenAI</small>
+                <small style="color: #666;">使用 OpenAI 時必填</small>
             </div>
 
             <div id="qdrant_openrouter_key_group" style="margin: 10px 0; display: none;">
-                <label><strong>OpenRouter API Key:</strong></label>
+                <label><strong>OpenRouter API Key：</strong></label>
                 <input type="password" id="qdrant_openrouter_key" class="text_pole" value="${settings.openRouterApiKey}"
                        placeholder="or-..." style="width: 100%; margin-top: 5px;" />
-                <small style="color: #666;">Required when using OpenRouter</small>
+                <small style="color: #666;">使用 OpenRouter 時必填</small>
+            </div>
+
+            <div id="qdrant_google_key_group" style="margin: 10px 0; display: none;">
+                <label><strong>Google AI API Key：</strong></label>
+                <input type="password" id="qdrant_google_key" class="text_pole" value="${settings.googleApiKey || ""}"
+                       placeholder="AIza..." style="width: 100%; margin-top: 5px;" />
+                <small style="color: #666;">前往 <a href="https://aistudio.google.com/app/apikey" target="_blank">Google AI Studio</a> 取得 API Key</small>
+            </div>
+
+            <div id="qdrant_google_base_url_group" style="margin: 10px 0; display: none;">
+                <label><strong>Google API Base URL：</strong></label>
+                <input type="text" id="qdrant_google_base_url" class="text_pole" value="${settings.googleApiBaseUrl || "https://generativelanguage.googleapis.com/v1beta"}"
+                       placeholder="https://generativelanguage.googleapis.com/v1beta" style="width: 100%; margin-top: 5px;" />
+                <small style="color: #666;">通常不需要修改（除非使用代理或鏡像）</small>
             </div>
 
             <div id="qdrant_local_url_group" style="margin: 10px 0; display: none;">
-                <label><strong>Embedding URL:</strong></label>
+                <label><strong>嵌入服務 URL：</strong></label>
                 <input type="text" id="qdrant_local_url" class="text_pole" value="${settings.localEmbeddingUrl}"
                        placeholder="http://localhost:11434/api/embeddings"
                        style="width: 100%; margin-top: 5px;" />
-                <small style="color: #666;">Endpoint that accepts OpenAI-compatible embedding requests</small>
+                <small style="color: #666;">支援 OpenAI 相容嵌入請求格式的端點</small>
             </div>
 
             <div id="qdrant_local_api_key_group" style="margin: 10px 0; display: none;">
-                <label><strong>Embedding API Key (optional):</strong></label>
+                <label><strong>嵌入服務 API Key（選填）：</strong></label>
                 <input type="password" id="qdrant_local_api_key" class="text_pole" value="${settings.localEmbeddingApiKey}"
-                       placeholder="Bearer token for local endpoint"
+                       placeholder="本機端點所需的 Bearer Token"
                        style="width: 100%; margin-top: 5px;" />
-                <small style="color: #666;">Used if your local/custom endpoint requires authentication</small>
+                <small style="color: #666;">當您本機 / 自訂端點需要驗證時使用</small>
             </div>
 
             <div id="qdrant_local_dimensions_group" style="margin: 10px 0; display: none;">
-                <label><strong>Embedding dimensions:</strong></label>
+                <label><strong>嵌入向量維度：</strong></label>
                 <input type="number" id="qdrant_local_dimensions" class="text_pole"
                        value="${settings.customEmbeddingDimensions ?? ""}"
-                       min="1" step="1" style="width: 100%; margin-top: 5px;" placeholder="Auto-detect after first call" />
-                <small style="color: #666;">Vector size returned by your custom embedding model (leave blank to auto-detect)</small>
+                       min="1" step="1" style="width: 100%; margin-top: 5px;" placeholder="呼叫一次後自動偵測" />
+                <small style="color: #666;">您自訂模型回傳的向量維度（留空則自動偵測）</small>
             </div>
 
             <div id="qdrant_embedding_model_group" style="margin: 10px 0;">
-                <label><strong>Embedding Model:</strong></label>
-                <select id="qdrant_embedding_model" class="text_pole" style="width: 100%; margin-top: 5px;">
-                    <option value="text-embedding-3-large" ${settings.embeddingModel === "text-embedding-3-large" ? "selected" : ""}>text-embedding-3-large (best quality)</option>
-                    <option value="text-embedding-3-small" ${settings.embeddingModel === "text-embedding-3-small" ? "selected" : ""}>text-embedding-3-small (faster)</option>
-                    <option value="text-embedding-ada-002" ${settings.embeddingModel === "text-embedding-ada-002" ? "selected" : ""}>text-embedding-ada-002 (legacy)</option>
-                </select>
+                <label><strong>嵌入模型：</strong></label>
+                <div style="display: flex; gap: 5px; margin-top: 5px;">
+                    <select id="qdrant_embedding_model" class="text_pole" style="flex: 1;">
+                        <option value="text-embedding-3-large" ${settings.embeddingModel === "text-embedding-3-large" ? "selected" : ""}>text-embedding-3-large（最高品質）</option>
+                        <option value="text-embedding-3-small" ${settings.embeddingModel === "text-embedding-3-small" ? "selected" : ""}>text-embedding-3-small（較快）</option>
+                        <option value="text-embedding-ada-002" ${settings.embeddingModel === "text-embedding-ada-002" ? "selected" : ""}>text-embedding-ada-002（舊版）</option>
+                    </select>
+                    <button id="qdrant_fetch_models" class="menu_button" style="display: none; flex: 0 0 auto;" type="button" title="從 Google AI 抓取可用嵌入模型">
+                        <i class="fa-solid fa-rotate"></i> 重新抓取
+                    </button>
+                </div>
+                <small id="qdrant_model_hint" style="color: #666; display: none;">已從 Google AI 抓取可用模型清單</small>
             </div>
-            
+
             <hr style="margin: 15px 0;" />
-            
-            <h4>Memory Retrieval Settings</h4>
-            
+
+            <h4>記憶取回設定</h4>
+
             <div style="margin: 10px 0;">
-                <label><strong>Number of Memories:</strong> <span id="memory_limit_display">${settings.memoryLimit}</span></label>
-                <input type="range" id="qdrant_memory_limit" min="1" max="50" value="${settings.memoryLimit}" 
+                <label><strong>取回記憶數量：</strong> <span id="memory_limit_display">${settings.memoryLimit}</span></label>
+                <input type="range" id="qdrant_memory_limit" min="1" max="50" value="${settings.memoryLimit}"
                        style="width: 100%; margin-top: 5px;" />
-                <small style="color: #666;">Maximum memories to retrieve per generation</small>
-            </div>
-            
-            <div style="margin: 10px 0;">
-                <label><strong>Relevance Threshold:</strong> <span id="score_threshold_display">${settings.scoreThreshold}</span></label>
-                <input type="range" id="qdrant_score_threshold" min="0" max="1" step="0.05" value="${settings.scoreThreshold}" 
-                       style="width: 100%; margin-top: 5px;" />
-                <small style="color: #666;">Minimum similarity score (0.0 - 1.0)</small>
-            </div>
-            
-            <div style="margin: 10px 0;">
-                <label><strong>Memory Position:</strong> <span id="memory_position_display">${settings.memoryPosition}</span></label>
-                <input type="range" id="qdrant_memory_position" min="1" max="30" value="${settings.memoryPosition}" 
-                       style="width: 100%; margin-top: 5px;" />
-                <small style="color: #666;">How many messages from the end to insert memories</small>
-            </div>
-            
-            <div style="margin: 10px 0;">
-                <label><strong>Retain Recent Messages:</strong> <span id="retain_recent_display">${settings.retainRecentMessages}</span></label>
-                <input type="range" id="qdrant_retain_recent" min="0" max="50" value="${settings.retainRecentMessages}" 
-                       style="width: 100%; margin-top: 5px;" />
-                <small style="color: #666;">Exclude the last N messages from retrieval (0 = no exclusion)</small>
-            </div>
-            
-            <hr style="margin: 15px 0;" />
-            
-            <h4>Automatic Memory Creation</h4>
-            
-            <div style="margin: 10px 0;">
-                <label style="display: flex; align-items: center; gap: 10px;">
-                    <input type="checkbox" id="qdrant_per_character" ${settings.usePerCharacterCollections ? "checked" : ""} />
-                    <strong>Use Per-Character Collections</strong>
-                </label>
-                <small style="color: #666; display: block; margin-left: 30px;">Each character gets their own dedicated collection (recommended)</small>
-            </div>
-            
-            <div style="margin: 10px 0;">
-                <label style="display: flex; align-items: center; gap: 10px;">
-                    <input type="checkbox" id="qdrant_auto_save" ${settings.autoSaveMemories ? "checked" : ""} />
-                    <strong>Automatically Save Memories</strong>
-                </label>
-                <small style="color: #666; display: block; margin-left: 30px;">Save messages to Qdrant as conversations happen</small>
-            </div>
-            
-            <div style="margin: 10px 0;">
-                <label style="display: flex; align-items: center; gap: 10px;">
-                    <input type="checkbox" id="qdrant_save_user" ${settings.saveUserMessages ? "checked" : ""} />
-                    Save user messages
-                </label>
-            </div>
-            
-            <div style="margin: 10px 0;">
-                <label style="display: flex; align-items: center; gap: 10px;">
-                    <input type="checkbox" id="qdrant_save_character" ${settings.saveCharacterMessages ? "checked" : ""} />
-                    Save character messages
-                </label>
-            </div>
-            
-            <div style="margin: 10px 0;">
-                <label><strong>Minimum Message Length:</strong> <span id="min_message_length_display">${settings.minMessageLength}</span></label>
-                <input type="range" id="qdrant_min_length" min="5" max="50" value="${settings.minMessageLength}" 
-                       style="width: 100%; margin-top: 5px;" />
-                <small style="color: #666;">Minimum characters to save a message</small>
+                <small style="color: #666;">每次生成最多取回的記憶數量</small>
             </div>
 
             <div style="margin: 10px 0;">
-                <label><strong>Deduplication Threshold:</strong> <span id="dedupe_threshold_display">${settings.dedupeThreshold}</span></label>
-                <input type="range" id="qdrant_dedupe_threshold" min="0.80" max="1.00" step="0.01" value="${settings.dedupeThreshold}" 
+                <label><strong>相關性門檻：</strong> <span id="score_threshold_display">${settings.scoreThreshold}</span></label>
+                <input type="range" id="qdrant_score_threshold" min="0" max="1" step="0.05" value="${settings.scoreThreshold}"
                        style="width: 100%; margin-top: 5px;" />
-                <small style="color: #666;">Prevent saving duplicate chunks (higher = stricter)</small>
+                <small style="color: #666;">最低相似度分數（0.0 - 1.0）</small>
             </div>
-            
+
+            <div style="margin: 10px 0;">
+                <label><strong>記憶插入位置：</strong> <span id="memory_position_display">${settings.memoryPosition}</span></label>
+                <input type="range" id="qdrant_memory_position" min="1" max="30" value="${settings.memoryPosition}"
+                       style="width: 100%; margin-top: 5px;" />
+                <small style="color: #666;">從對話末端往前數第幾則訊息插入記憶</small>
+            </div>
+
+            <div style="margin: 10px 0;">
+                <label><strong>保留最近訊息：</strong> <span id="retain_recent_display">${settings.retainRecentMessages}</span></label>
+                <input type="range" id="qdrant_retain_recent" min="0" max="50" value="${settings.retainRecentMessages}"
+                       style="width: 100%; margin-top: 5px;" />
+                <small style="color: #666;">從取回結果中排除最近 N 則訊息（0 = 不排除）</small>
+            </div>
+
             <hr style="margin: 15px 0;" />
-            
-            <h4>Other Settings</h4>
-            
+
+            <h4>自動建立記憶</h4>
+
+            <div style="margin: 10px 0;">
+                <label style="display: flex; align-items: center; gap: 10px;">
+                    <input type="checkbox" id="qdrant_per_character" ${settings.usePerCharacterCollections ? "checked" : ""} />
+                    <strong>每個角色獨立 Collection</strong>
+                </label>
+                <small style="color: #666; display: block; margin-left: 30px;">每個角色都有自己的 Collection（建議啟用）</small>
+            </div>
+
+            <div style="margin: 10px 0;">
+                <label style="display: flex; align-items: center; gap: 10px;">
+                    <input type="checkbox" id="qdrant_auto_save" ${settings.autoSaveMemories ? "checked" : ""} />
+                    <strong>自動儲存記憶</strong>
+                </label>
+                <small style="color: #666; display: block; margin-left: 30px;">在對話進行時自動將訊息存入 Qdrant</small>
+            </div>
+
+            <div style="margin: 10px 0;">
+                <label style="display: flex; align-items: center; gap: 10px;">
+                    <input type="checkbox" id="qdrant_save_user" ${settings.saveUserMessages ? "checked" : ""} />
+                    儲存使用者訊息
+                </label>
+            </div>
+
+            <div style="margin: 10px 0;">
+                <label style="display: flex; align-items: center; gap: 10px;">
+                    <input type="checkbox" id="qdrant_save_character" ${settings.saveCharacterMessages ? "checked" : ""} />
+                    儲存角色訊息
+                </label>
+            </div>
+
+            <div style="margin: 10px 0;">
+                <label><strong>最短訊息長度：</strong> <span id="min_message_length_display">${settings.minMessageLength}</span></label>
+                <input type="range" id="qdrant_min_length" min="5" max="50" value="${settings.minMessageLength}"
+                       style="width: 100%; margin-top: 5px;" />
+                <small style="color: #666;">少於此字元數的訊息不會儲存</small>
+            </div>
+
+            <div style="margin: 10px 0;">
+                <label><strong>去重門檻：</strong> <span id="dedupe_threshold_display">${settings.dedupeThreshold}</span></label>
+                <input type="range" id="qdrant_dedupe_threshold" min="0.80" max="1.00" step="0.01" value="${settings.dedupeThreshold}"
+                       style="width: 100%; margin-top: 5px;" />
+                <small style="color: #666;">避免儲存重複內容（數值越高越嚴格）</small>
+            </div>
+
+            <hr style="margin: 15px 0;" />
+
+            <h4>其他設定</h4>
+
             <div style="margin: 15px 0;">
                 <label style="display: flex; align-items: center; gap: 10px;">
                     <input type="checkbox" id="qdrant_prevent_duplicate" ${settings.preventDuplicateInjection ? "checked" : ""} />
-                    Prevent duplicate memory injection
+                    防止重複注入記憶
                 </label>
-                <small style="color: #666; display: block; margin-left: 30px;">Prevent memories from being added to context multiple times</small>
+                <small style="color: #666; display: block; margin-left: 30px;">避免同一段記憶被多次插入到上下文中</small>
             </div>
-            
+
             <div style="margin: 15px 0;">
                 <label style="display: flex; align-items: center; gap: 10px;">
                     <input type="checkbox" id="qdrant_notifications" ${settings.showMemoryNotifications ? "checked" : ""} />
-                    Show memory notifications
+                    顯示記憶通知
                 </label>
             </div>
-            
+
             <div style="margin: 15px 0;">
                 <label style="display: flex; align-items: center; gap: 10px;">
                     <input type="checkbox" id="qdrant_debug" ${settings.debugMode ? "checked" : ""} />
-                    Debug Mode (check console)
+                    除錯模式（請查看主控台）
                 </label>
             </div>
-            
+
             <hr style="margin: 15px 0;" />
-            
+
             <div style="margin: 15px 0; display: flex; gap: 10px; flex-wrap: wrap;">
-                <button id="qdrant_test" class="menu_button">Test Connection</button>
-                <button id="qdrant_save" class="menu_button">Save Settings</button>
-                <button id="qdrant_view_memories" class="menu_button">View Memories</button>
-                <button id="qdrant_index_chats" class="menu_button" style="background-color: #28a745; color: white;">Index Character Chats</button>
+                <button id="qdrant_test" class="menu_button">測試連線</button>
+                <button id="qdrant_save" class="menu_button">儲存設定</button>
+                <button id="qdrant_view_memories" class="menu_button">檢視記憶</button>
+                <button id="qdrant_index_chats" class="menu_button" style="background-color: #28a745; color: white;">索引角色聊天記錄</button>
             </div>
             
             <div id="qdrant_status" style="margin-top: 10px; padding: 10px; border-radius: 5px;"></div>
@@ -2401,14 +2512,19 @@ function createSettingsUI() {
     const provider = settings.embeddingProvider || "openai"
     const $openAIGroup = $("#qdrant_openai_key_group")
     const $openRouterGroup = $("#qdrant_openrouter_key_group")
+    const $googleGroup = $("#qdrant_google_key_group")
+    const $googleBaseUrlGroup = $("#qdrant_google_base_url_group")
     const $localGroup = $("#qdrant_local_url_group")
     const $localApiKeyGroup = $("#qdrant_local_api_key_group")
     const $localDimensionsGroup = $("#qdrant_local_dimensions_group")
     const $localDimensionsInput = $("#qdrant_local_dimensions")
     const $modelGroup = $("#qdrant_embedding_model_group")
+    const $fetchModelsBtn = $("#qdrant_fetch_models")
 
     $openAIGroup.toggle(provider === "openai")
     $openRouterGroup.toggle(provider === "openrouter")
+    $googleGroup.toggle(provider === "google")
+    $googleBaseUrlGroup.toggle(provider === "google")
     $localGroup.toggle(provider === "local")
     $localApiKeyGroup.toggle(provider === "local")
     $localDimensionsGroup.toggle(provider === "local")
@@ -2419,6 +2535,7 @@ function createSettingsUI() {
 
     const showModelSelect = provider !== "local"
     $modelGroup.toggle(showModelSelect)
+    $fetchModelsBtn.toggle(provider === "google")
 
     if (showModelSelect) {
       updateEmbeddingModelOptions(provider)
@@ -2453,6 +2570,65 @@ function createSettingsUI() {
 
   $("#qdrant_openrouter_key").on("input", function () {
     settings.openRouterApiKey = $(this).val()
+  })
+
+  $("#qdrant_google_key").on("input", function () {
+    settings.googleApiKey = $(this).val()
+  })
+
+  $("#qdrant_google_base_url").on("input", function () {
+    settings.googleApiBaseUrl = $(this).val()
+  })
+
+  $("#qdrant_fetch_models").on("click", async function () {
+    const toastr = window.toastr
+    const $btn = $(this)
+    const $hint = $("#qdrant_model_hint")
+    const $modelSelect = $("#qdrant_embedding_model")
+    const originalHtml = $btn.html()
+
+    $btn.prop("disabled", true).html('<i class="fa-solid fa-spinner fa-spin"></i> 抓取中...')
+
+    try {
+      const fetchedModels = await fetchGoogleEmbeddingModels(
+        settings.googleApiKey,
+        settings.googleApiBaseUrl
+      )
+
+      if (!fetchedModels || fetchedModels.length === 0) {
+        toastr.warning("Google AI 沒有回傳任何嵌入模型", "Qdrant Memory")
+        return
+      }
+
+      // Update the option list and remember selection
+      EMBEDDING_MODEL_OPTIONS.google = fetchedModels.map((m) => ({
+        value: m.value,
+        label: m.label,
+      }))
+
+      const previousValue = settings.embeddingModel
+      $modelSelect.empty()
+      let matched = false
+      fetchedModels.forEach((m) => {
+        const isSelected = m.value === previousValue
+        if (isSelected) matched = true
+        const opt = `<option value="${m.value}"${isSelected ? " selected" : ""}>${m.label}</option>`
+        $modelSelect.append(opt)
+      })
+
+      if (!matched) {
+        settings.embeddingModel = fetchedModels[0].value
+        $modelSelect.val(settings.embeddingModel)
+      }
+
+      $hint.text(`已從 Google AI 抓取 ${fetchedModels.length} 個可用嵌入模型`).show()
+      toastr.success(`成功抓取 ${fetchedModels.length} 個 Google AI 嵌入模型`, "Qdrant Memory")
+    } catch (err) {
+      console.error("[Qdrant Memory] Failed to fetch Google models:", err)
+      toastr.error(err.message || "抓取 Google AI 模型清單失敗", "Qdrant Memory")
+    } finally {
+      $btn.prop("disabled", false).html(originalHtml)
+    }
   })
 
   $("#qdrant_local_url").on("input", function () {
@@ -2535,14 +2711,14 @@ function createSettingsUI() {
   $("#qdrant_save").on("click", () => {
     saveSettings()
     $("#qdrant_status")
-      .text("✓ Settings saved!")
+      .text("✓ 設定已儲存！")
       .css({ color: "green", background: "#d4edda", border: "1px solid green" })
     setTimeout(() => $("#qdrant_status").text("").css({ background: "", border: "" }), 3000)
   })
 
   $("#qdrant_test").on("click", async () => {
     $("#qdrant_status")
-      .text("Testing connection...")
+      .text("測試連線中...")
       .css({ color: "#004085", background: "#cce5ff", border: "1px solid #004085" })
 
     try {
@@ -2554,16 +2730,16 @@ function createSettingsUI() {
         const data = await response.json()
         const collections = data.result?.collections || []
         $("#qdrant_status")
-          .text(`✓ Connected! Found ${collections.length} collections.`)
+          .text(`✓ 連線成功！共有 ${collections.length} 個 Collection。`)
           .css({ color: "green", background: "#d4edda", border: "1px solid green" })
       } else {
         $("#qdrant_status")
-          .text("✗ Connection failed. Check URL.")
+          .text("✗ 連線失敗，請檢查 URL。")
           .css({ color: "#721c24", background: "#f8d7da", border: "1px solid #721c24" })
       }
     } catch (error) {
       $("#qdrant_status")
-        .text(`✗ Error: ${error.message}`)
+        .text(`✗ 錯誤：${error.message}`)
         .css({ color: "#721c24", background: "#f8d7da", border: "1px solid #721c24" })
     }
   })

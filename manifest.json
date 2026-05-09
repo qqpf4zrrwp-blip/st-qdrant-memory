@@ -5,7 +5,7 @@
   "css": "style.css",
   "author": "Community",
   "version": "3.0.0",
-  "description": "Automatic memory creation with per-character collections. Retrieves relevant memories from Qdrant and injects them into conversations before generation.",
+  "description": "自動建立角色獨立的長期記憶。在生成回覆前自動從 Qdrant 取回相關記憶並注入對話中。支援 OpenAI、OpenRouter、Google AI 與自訂嵌入端點。",
   "generate_interceptor": "qdrantMemoryInterceptor",
   "minimum_client_version": "1.11.0"
 }
